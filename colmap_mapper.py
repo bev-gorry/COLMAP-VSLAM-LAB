@@ -43,7 +43,8 @@ def select_best_model(exp_folder_colmap: Path) -> tuple[Path, int]:
 
 
 def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, camera_name: str,
-               mapper_type: str, optimize_intrinsics: int, settings: Settings | None = None) -> Path:
+               mapper_type: str, optimize_intrinsics: int, settings: Settings | None = None,
+               random_seed: int = -1) -> Path:
     """Reconstruct from <exp_folder_colmap>/colmap_database.db; returns the best sub-model folder.
     settings: the [mapper] section of the settings yaml (Mapper_* keys reach mapper, GlobalMapper_* keys glomap)."""
     print("Executing colmap_mapper ...")
@@ -73,7 +74,9 @@ def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, 
     else:
         print("    colmap mapper (COLMAP) ...")
         command, prefix = "mapper", "Mapper"
-    explicit = [f"{prefix}.ba_refine_focal_length", f"{prefix}.ba_refine_principal_point", f"{prefix}.ba_refine_extra_params"]
+    # random_seed: -1 keeps COLMAP's default (non-deterministic); >= 0 makes reruns repeatable
+    explicit = [f"{prefix}.ba_refine_focal_length", f"{prefix}.ba_refine_principal_point", f"{prefix}.ba_refine_extra_params",
+                f"{prefix}.random_seed"]
     run(["colmap", command,
          "--database_path", str(database),
          "--image_path", str(rgb_path),
@@ -81,6 +84,7 @@ def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, 
          f"--{prefix}.ba_refine_focal_length", ba_refine_focal_length,
          f"--{prefix}.ba_refine_principal_point", ba_refine_principal_point,
          f"--{prefix}.ba_refine_extra_params", ba_refine_extra_params,
+         f"--{prefix}.random_seed", str(random_seed),
          *settings_args(settings, "mapper", command, explicit)])
 
     best_model, best_num_images = select_best_model(exp_folder_colmap)

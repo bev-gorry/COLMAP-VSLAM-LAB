@@ -10,11 +10,15 @@ Module: VSLAM-LAB - Baselines - colmap - colmap_matcher.py
 Feature extraction and matching stage of the colmap pipeline (Python port of colmap_matcher.sh):
 creates the COLMAP database, extracts features for the frames listed in the experiment's rgb csv
 (optionally masked) and matches them exhaustively or sequentially. Called by vslamlab_colmap.py.
+
+matcher_type 'hybrid': exhaustive SIFT matching for every pair, then hybrid_matcher.py adds
+SuperPoint/LightGlue matches for VPR-selected cross-session pairs (run in the colmap-lightglue env), then
+`colmap geometric_verifier` verifies the combined matches (see run_hybrid).
 """
 
 from pathlib import Path
 
-from colmap_utilities import PROFILER, Settings, colmap_camera, detect_gpus, run, settings_args
+from colmap_utilities import COLMAP_DIR, PROFILER, Settings, colmap_camera, detect_gpus, run, settings_args
 from create_colmap_image_list import create_colmap_image_list
 from create_colmap_mask_dir import create_colmap_mask_dir
 
@@ -40,9 +44,13 @@ MATCHING_TYPES: dict[str, tuple[str, str]] = {
 
 def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rgb_csv: Path, calibration_yaml: Path,
                 camera_name: str, matcher_type: str, matching_type: str, use_gpu: int, use_mask: int,
-                settings: Settings | None = None) -> Path:
+                settings: Settings | None = None, single_camera_per_folder: int = 1,
+                hybrid: dict | None = None) -> Path:
     """Build <exp_folder_colmap>/colmap_database.db with features and matches; returns its path.
-    settings: the [feature_extractor] / [matcher] sections of the settings yaml (colmap_utilities.load_settings)."""
+    settings: the [feature_extractor] / [matcher] sections of the settings yaml (colmap_utilities.load_settings).
+    single_camera_per_folder: 1 -> one camera per image folder (COLMAP resolves symlinks, so combined multi-session
+    sequences get one camera per session); 0 -> one camera for every image (the original hybrid pipeline's setting).
+    hybrid: options of matcher_type 'hybrid' (see run_hybrid)."""
     settings = settings or {}
     print("\nExecuting colmap_matcher ...")
     PROFILER.set_stage("extraction")
@@ -98,7 +106,7 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
          "--image_list_path", str(colmap_image_list),
          "--ImageReader.camera_model", colmap_camera_model,
          "--ImageReader.single_camera", "1",
-         "--ImageReader.single_camera_per_folder", "1",
+         "--ImageReader.single_camera_per_folder", str(single_camera_per_folder),
          "--FeatureExtraction.type", feature_extraction_type,
          "--FeatureExtraction.use_gpu", str(use_gpu),
          "--FeatureExtraction.gpu_index", gpu_index_list,
@@ -115,7 +123,9 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
                         "SequentialMatching.loop_detection", "SequentialMatching.vocab_tree_path"]
 
     PROFILER.set_stage("matching")
-    if matcher_type == "exhaustive":
+    if matcher_type == "hybrid" and feature_matching_type != "SIFT_BRUTEFORCE":
+        raise SystemExit(f"matcher_type: hybrid needs matching_type: sift_bruteforce (got {matching_type})")
+    if matcher_type in ("exhaustive", "hybrid"):
         print(f"    colmap exhaustive_matcher ({feature_matching_type}) ...")
         print(f"        gpu_index: {gpu_index_list}")
         run(["colmap", "exhaustive_matcher", *matching_args,
@@ -133,4 +143,68 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
     else:
         raise SystemExit(f"Unknown matcher_type: {matcher_type}")
 
+    if matcher_type == "hybrid":
+        run_hybrid(database, sequence_path, rgb_path, rgb_csv, camera_name, num_threads, hybrid or {}, settings)
+
     return database
+
+
+# Two-view verification profiles for matcher_type 'hybrid'. 'glomap' mirrors the relative-pose stage of standalone
+# GLOMAP 1.2.0 (the original hybrid pipeline's mapper): essential-matrix RANSAC with a 1 px error, 50k trials, 0.9999
+# confidence, then pairs with < 30 inliers or an inlier ratio < 0.25 dropped (glomap relpose_estimation.h,
+# relpose_filter.h, poselib RansacOptions defaults). 'colmap' is COLMAP 4.2.1's default verification.
+VERIFICATION_PROFILES: dict[str, dict[str, str]] = {
+    "colmap": {},
+    "glomap": {"TwoViewGeometry.max_error": "1", "TwoViewGeometry.max_num_trials": "50000",
+               "TwoViewGeometry.confidence": "0.9999", "TwoViewGeometry.min_num_inliers": "30",
+               "TwoViewGeometry.min_inlier_ratio": "0.25"},
+}
+
+
+def resolve_sequence_file(sequence_path: Path, value: str, default: str) -> Path:
+    """An experiment path parameter: '' -> the default inside the sequence folder, relative -> inside the
+    sequence folder, absolute -> as given."""
+    path = Path(value) if value else Path(default)
+    return path if path.is_absolute() else sequence_path / path
+
+
+def run_hybrid(database: Path, sequence_path: Path, rgb_path: Path, rgb_csv: Path, camera_name: str, num_threads: int,
+               hybrid: dict, settings: Settings) -> None:
+    """Hybrid matching on a database holding exhaustive SIFT features + raw matches:
+    1. hybrid_matcher.py (colmap-lightglue env): SuperPoint/LightGlue on the selected pairs, combined with raw SIFT.
+    2. verification 'colmap' / 'glomap': `colmap geometric_verifier` with that profile. 'none' keeps the original
+       pipeline's all-inlier geometries, which COLMAP 4.x's global mapper (mapper_type: glomap) cannot handle (it no longer
+       re-estimates relative poses, so outliers would reach rotation averaging); use it with the incremental mapper."""
+    verification = hybrid.get("verification", "colmap")
+    if verification not in ("colmap", "glomap", "none"):
+        raise SystemExit(f"Unknown verification: {verification}")
+    vpr_matrix = resolve_sequence_file(sequence_path, hybrid.get("vpr_matrix", ""), "vpr-lab/D.npy")
+    vpr_rgb_csv = resolve_sequence_file(sequence_path, hybrid.get("vpr_rgb_csv", ""), "rgb.csv")
+
+    print("    hybrid matcher (SuperPoint + LightGlue) ...")
+    print(f"        pair_selection: {hybrid.get('pair_selection', 'vpr')}, vpr_threshold: {hybrid.get('vpr_threshold', 0.5)}")
+    print(f"        vpr_matrix: {vpr_matrix}  (rows: {vpr_rgb_csv})")
+    print(f"        lg_min_matches: {hybrid.get('lg_min_matches', 40)}, min_matches: {hybrid.get('min_matches', 10)}, verification: {verification}")
+
+    # The matcher runs in its own env (torch + LightGlue at pinned versions); the colmap env has no torch.
+    pixi = ["pixi", "run", "--frozen", "--manifest-path", str(COLMAP_DIR.parents[1] / "pixi.toml"), "-e", "colmap-lightglue"]
+    run([*pixi, "install-lightglue"])
+    run([*pixi, "python", str(COLMAP_DIR / "hybrid_matcher.py"),
+         "--database", str(database), "--rgb_path", str(rgb_path), "--rgb_csv", str(rgb_csv), "--camera_name", camera_name,
+         "--pair_selection", str(hybrid.get("pair_selection", "vpr")),
+         "--vpr_matrix", str(vpr_matrix), "--vpr_rgb_csv", str(vpr_rgb_csv),
+         "--vpr_threshold", str(hybrid.get("vpr_threshold", 0.5)),
+         "--lg_min_matches", str(hybrid.get("lg_min_matches", 40)), "--min_matches", str(hybrid.get("min_matches", 10)),
+         "--verification", verification])
+
+    if verification == "none":
+        print("        verification: none (all matches stored as inliers, as in the original pipeline)")
+        return
+    profile = VERIFICATION_PROFILES[verification]
+    seed = int(hybrid.get("random_seed", -1))
+    explicit = ["TwoViewGeometry.random_seed", "num_threads", *profile]
+    print(f"    colmap geometric_verifier (profile: {verification}) ...")
+    run(["colmap", "geometric_verifier", "--database_path", str(database), "--num_threads", str(num_threads),
+         "--TwoViewGeometry.random_seed", str(seed),
+         *[tok for option, value in profile.items() for tok in (f"--{option}", value)],
+         *settings_args(settings, "matcher", "geometric_verifier", explicit)])

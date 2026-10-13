@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     # Baseline parameters (baseline_colmap.py default_parameters, overridable per experiment)
     parser.add_argument("--verbose", type=int, default=0)
     parser.add_argument("--mode", type=str, default="mono")
-    parser.add_argument("--matcher_type", type=str, default="exhaustive", choices=["exhaustive", "sequential"])
+    parser.add_argument("--matcher_type", type=str, default="exhaustive", choices=["exhaustive", "sequential", "hybrid"])
     parser.add_argument("--matching_type", type=str, default="sift_bruteforce", choices=list(MATCHING_TYPES))
     parser.add_argument("--mapper_type", type=str, default="colmap", choices=["colmap", "glomap"])
     parser.add_argument("--rgb_max", type=int, default=None, help="consumed by the run pipeline; accepted here because it is forwarded")
@@ -55,6 +55,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dense", type=int, default=0)
     parser.add_argument("--dense_max_image_size", type=int, default=1600)
     parser.add_argument("--mesher", type=str, default="none", choices=list(MESHERS))
+    # Camera grouping, repeatability, and matcher_type 'hybrid' (colmap_matcher.run_hybrid)
+    parser.add_argument("--single_camera_per_folder", type=int, default=1)
+    parser.add_argument("--random_seed", type=int, default=-1)
+    parser.add_argument("--pair_selection", type=str, default="vpr", choices=["vpr", "cross_session", "all"])
+    parser.add_argument("--vpr_matrix", type=str, default="")
+    parser.add_argument("--vpr_rgb_csv", type=str, default="")
+    parser.add_argument("--vpr_threshold", type=float, default=0.5)
+    parser.add_argument("--lg_min_matches", type=int, default=40)
+    parser.add_argument("--min_matches", type=int, default=10)
+    parser.add_argument("--verification", type=str, default="colmap", choices=["colmap", "glomap", "none"])
     # Not exposed as baseline parameters
     parser.add_argument("--use_gpu", type=int, default=1)
     parser.add_argument("--camera_name", type=str, default="rgb_0")
@@ -79,6 +89,13 @@ def main() -> None:
     print(f"  Dense             : {args.dense}")
     print(f"  Dense Max Img Size: {args.dense_max_image_size}")
     print(f"  Mesher            : {args.mesher}")
+    print(f"  Camera per folder : {args.single_camera_per_folder}")
+    print(f"  Random seed       : {args.random_seed}")
+    if args.matcher_type == "hybrid":
+        print(f"  Pair selection    : {args.pair_selection} (vpr_threshold {args.vpr_threshold})")
+        print(f"  VPR matrix        : {args.vpr_matrix or '<sequence>/vpr-lab/D.npy'} (rows: {args.vpr_rgb_csv or '<sequence>/rgb.csv'})")
+        print(f"  LightGlue min     : {args.lg_min_matches}, min matches: {args.min_matches}")
+        print(f"  Verification      : {args.verification}")
     print(f"  Settings YAML     : {args.settings_yaml}")
     print(f"  Calibration YAML  : {args.calibration_yaml}")
     print(f"  RGB CSV           : {args.rgb_csv}")
@@ -109,10 +126,16 @@ def run_pipeline(args: argparse.Namespace, exp_id: str, exp_folder_colmap: Path)
     # COLMAP options from the settings yaml (forwarded per stage, see colmap_utilities.settings_args)
     settings = load_settings(args.settings_yaml)
 
+    hybrid = {key: getattr(args, key) for key in ("pair_selection", "vpr_matrix", "vpr_rgb_csv", "vpr_threshold",
+                                                  "lg_min_matches", "min_matches", "verification", "random_seed")}
+    if args.matcher_type == "hybrid" and args.verification == "none" and args.mapper_type == "glomap":
+        print("    WARNING: verification 'none' with mapper_type 'glomap': COLMAP 4.x's global mapper does not re-estimate "
+              "relative poses, so unverified matches reach rotation averaging (see colmap_matcher.run_hybrid)")
     database = run_matcher(args.sequence_path, exp_folder_colmap, rgb_path, args.rgb_csv, args.calibration_yaml, args.camera_name,
-                           args.matcher_type, args.matching_type, args.use_gpu, args.use_mask, settings)
+                           args.matcher_type, args.matching_type, args.use_gpu, args.use_mask, settings,
+                           single_camera_per_folder=args.single_camera_per_folder, hybrid=hybrid)
     best_model = run_mapper(exp_folder_colmap, rgb_path, args.calibration_yaml, args.camera_name, args.mapper_type,
-                            args.optimize_intrinsics, settings)
+                            args.optimize_intrinsics, settings, random_seed=args.random_seed)
 
     # Convert COLMAP outputs to a format suitable for VSLAM-LAB
     PROFILER.set_stage("trajectory")
