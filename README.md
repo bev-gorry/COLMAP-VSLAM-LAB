@@ -96,7 +96,8 @@ Inside the experiment's sequence folder (`<evaluation>/<experiment>/<DATASET>/<s
 | File | Content |
 |---|---|
 | `<exp_id>_KeyFrameTrajectory.csv` | the trajectory VSLAM-LAB evaluates (`ts (ns), tx, ty, tz, qx, qy, qz, qw`) |
-| `<exp_id>_profiling.csv` | one row per COLMAP command (`stage, step, start (s), duration (s), status`) plus per-stage totals; a stage summary is also printed at the end of `system_output_<exp_id>.txt` |
+| `<exp_id>_profiling.csv` | one row per COLMAP command (`stage, step, start (s), duration (s), status, peak RAM (GB), peak GPU (GB)`) plus per-stage totals; a stage summary is also printed at the end of `system_output_<exp_id>.txt` |
+| `<exp_id>_run_report.yaml` | the run in one readable file (`run_report.py`): configuration (VPR, features, thresholds, verification, mapper), input images and resolution, pair counts, registration coverage, runtimes, peak memory, hardware |
 | `<exp_id>_dense.ply`, `<exp_id>_mesh.ply` | fused point cloud and mesh when `dense: 1` |
 | `colmap_<exp_id>/` | database, image list, sub-models `0/`, `1/`, ... (`best_model` names the one used), TXT export, `dense/` workspace (`fused.ply`, `meshed-*.ply`, `sparse_fused/` for the gui) |
 

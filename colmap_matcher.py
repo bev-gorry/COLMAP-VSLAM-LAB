@@ -12,10 +12,11 @@ creates the COLMAP database, extracts features for the frames listed in the expe
 (optionally masked) and matches them exhaustively or sequentially. Called by vslamlab_colmap.py.
 
 matcher_type 'hybrid': exhaustive SIFT matching for every pair, then hybrid_matcher.py adds
-SuperPoint/LightGlue matches for VPR-selected cross-session pairs (run in the colmap-lightglue env), then
+learned-feature matches (hybrid_features, hybrid_matching) for VPR-selected cross-session pairs (run in the colmap-lightglue env), then
 `colmap geometric_verifier` verifies the combined matches (see run_hybrid).
 """
 
+import json
 from pathlib import Path
 
 from colmap_utilities import COLMAP_DIR, PROFILER, Settings, colmap_camera, detect_gpus, run, settings_args
@@ -45,12 +46,13 @@ MATCHING_TYPES: dict[str, tuple[str, str]] = {
 def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rgb_csv: Path, calibration_yaml: Path,
                 camera_name: str, matcher_type: str, matching_type: str, use_gpu: int, use_mask: int,
                 settings: Settings | None = None, single_camera_per_folder: int = 1,
-                hybrid: dict | None = None) -> Path:
+                hybrid: dict | None = None, camera_model: str = "") -> Path:
     """Build <exp_folder_colmap>/colmap_database.db with features and matches; returns its path.
     settings: the [feature_extractor] / [matcher] sections of the settings yaml (colmap_utilities.load_settings).
     single_camera_per_folder: 1 -> one camera per image folder (COLMAP resolves symlinks, so combined multi-session
     sequences get one camera per session); 0 -> one camera for every image (the original hybrid pipeline's setting).
-    hybrid: options of matcher_type 'hybrid' (see run_hybrid)."""
+    hybrid: options of matcher_type 'hybrid' (see run_hybrid).
+    camera_model: COLMAP camera model for an 'unknown' calibration ('' -> OPENCV); a known calibration sets its own."""
     settings = settings or {}
     print("\nExecuting colmap_matcher ...")
     PROFILER.set_stage("extraction")
@@ -62,6 +64,10 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
     gpu_index_list, num_threads = detect_gpus(use_gpu)
 
     calibration_model, colmap_camera_model, camera_params = colmap_camera(calibration_yaml, camera_name)
+    if camera_model:
+        if calibration_model != "unknown":
+            raise SystemExit(f"camera_model {camera_model} needs an 'unknown' calibration; {calibration_yaml} has {calibration_model}")
+        colmap_camera_model = camera_model
 
     colmap_image_list = exp_folder_colmap / "colmap_image_list.txt"
     create_colmap_image_list(str(rgb_csv), str(colmap_image_list), camera_name)
@@ -171,7 +177,8 @@ def resolve_sequence_file(sequence_path: Path, value: str, default: str) -> Path
 def run_hybrid(database: Path, sequence_path: Path, rgb_path: Path, rgb_csv: Path, camera_name: str, num_threads: int,
                hybrid: dict, settings: Settings) -> None:
     """Hybrid matching on a database holding exhaustive SIFT features + raw matches:
-    1. hybrid_matcher.py (colmap-lightglue env): SuperPoint/LightGlue on the selected pairs, combined with raw SIFT.
+    1. hybrid_matcher.py (colmap-lightglue env): hybrid_features matched with hybrid_matching on the selected pairs,
+       combined with raw SIFT.
     2. verification 'colmap' / 'glomap': `colmap geometric_verifier` with that profile. 'none' keeps the original
        pipeline's all-inlier geometries, which COLMAP 4.x's global mapper (mapper_type: glomap) cannot handle (it no longer
        re-estimates relative poses, so outliers would reach rotation averaging); use it with the incremental mapper."""
@@ -181,21 +188,26 @@ def run_hybrid(database: Path, sequence_path: Path, rgb_path: Path, rgb_csv: Pat
     vpr_matrix = resolve_sequence_file(sequence_path, hybrid.get("vpr_matrix", ""), "vpr-lab/D.npy")
     vpr_rgb_csv = resolve_sequence_file(sequence_path, hybrid.get("vpr_rgb_csv", ""), "rgb.csv")
 
-    print("    hybrid matcher (SuperPoint + LightGlue) ...")
+    features, matching = hybrid.get("hybrid_features", "superpoint"), hybrid.get("hybrid_matching", "lightglue")
+    print(f"    hybrid matcher ({features} + {matching}) ...")
     print(f"        pair_selection: {hybrid.get('pair_selection', 'vpr')}, vpr_threshold: {hybrid.get('vpr_threshold', 0.5)}")
     print(f"        vpr_matrix: {vpr_matrix}  (rows: {vpr_rgb_csv})")
     print(f"        lg_min_matches: {hybrid.get('lg_min_matches', 40)}, min_matches: {hybrid.get('min_matches', 10)}, verification: {verification}")
 
     # The matcher runs in its own env (torch + LightGlue at pinned versions); the colmap env has no torch.
     pixi = ["pixi", "run", "--frozen", "--manifest-path", str(COLMAP_DIR.parents[1] / "pixi.toml"), "-e", "colmap-lightglue"]
-    run([*pixi, "install-lightglue"])
+    run([*pixi, "install-lightglue"], profile=False)
     run([*pixi, "python", str(COLMAP_DIR / "hybrid_matcher.py"),
          "--database", str(database), "--rgb_path", str(rgb_path), "--rgb_csv", str(rgb_csv), "--camera_name", camera_name,
-         "--pair_selection", str(hybrid.get("pair_selection", "vpr")),
+         "--features", features, "--matching", matching, "--pair_selection", str(hybrid.get("pair_selection", "vpr")),
          "--vpr_matrix", str(vpr_matrix), "--vpr_rgb_csv", str(vpr_rgb_csv),
          "--vpr_threshold", str(hybrid.get("vpr_threshold", 0.5)),
          "--lg_min_matches", str(hybrid.get("lg_min_matches", 40)), "--min_matches", str(hybrid.get("min_matches", 10)),
-         "--verification", verification])
+         "--verification", verification], step="hybrid_matcher")
+    # Profile only the matcher's processing time (time_total_s), not pixi start-up and the torch / LightGlue imports
+    stats_json = database.parent / "hybrid_matcher_stats.json"
+    if stats_json.is_file():
+        PROFILER.set_last_duration(json.loads(stats_json.read_text())["time_total_s"])
 
     if verification == "none":
         print("        verification: none (all matches stored as inliers, as in the original pipeline)")

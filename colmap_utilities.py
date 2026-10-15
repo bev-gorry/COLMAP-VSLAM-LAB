@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
@@ -33,18 +34,20 @@ class Profiler:
     """Per-run timing of the pipeline, written to <exp_folder>/<exp_id>_profiling.csv.
 
     Every command that goes through run() is one row (its stage, the COLMAP sub-command, start offset,
-    duration, status); Python-side work is recorded with step(). Stage functions call
+    duration, status, peak RAM and GPU memory of the command's process tree, see MemorySampler); Python-side
+    work is recorded with step() (no memory columns). Stage functions call
     PROFILER.set_stage('extraction') etc. at their boundaries. The csv is rewritten after every step, so a run that dies
     half-way keeps the rows up to the failure; it ends with one 'total' row per stage and an 'all'
     total (the interactive 'gui' stage is listed but excluded from 'all'). summary() prints the stage
     table at the end of the system output."""
 
-    COLUMNS = ("stage", "step", "start (s)", "duration (s)", "status")
+    COLUMNS = ("stage", "step", "start (s)", "duration (s)", "status", "peak RAM (GB)", "peak GPU (GB)")
 
     def __init__(self) -> None:
         self.path: Path | None = None
         self.t0 = time.perf_counter()
-        self.rows: list[tuple[str, str, float, float, str]] = []
+        # (stage, step, start, duration, status, peak RAM GB or None, peak GPU GB or None)
+        self.rows: list[tuple[str, str, float, float, str, float | None, float | None]] = []
         self.current_stage = "setup"
 
     def start(self, path: Path) -> None:
@@ -55,9 +58,10 @@ class Profiler:
         """Stage the following steps belong to (extraction, matching, reconstruction, trajectory, dense, gui)."""
         self.current_stage = name
 
-    def record(self, step: str, start: float, status: str = "ok") -> None:
-        now = time.perf_counter()
-        self.rows.append((self.current_stage, step, start - self.t0, now - start, status))
+    def record(self, step: str, start: float, status: str = "ok",
+               peak_ram_gb: float | None = None, peak_gpu_gb: float | None = None, end: float | None = None) -> None:
+        end = time.perf_counter() if end is None else end
+        self.rows.append((self.current_stage, step, start - self.t0, end - start, status, peak_ram_gb, peak_gpu_gb))
         self.write()
 
     @contextlib.contextmanager
@@ -71,15 +75,29 @@ class Profiler:
         finally:
             self.record(name, start, status)
 
+    def set_last_duration(self, duration: float) -> None:
+        """Replace the last row's duration, for a command that reports its own processing time (hybrid matcher)."""
+        stage, step, start, _, status, ram, gpu = self.rows[-1]
+        self.rows[-1] = (stage, step, start, duration, status, ram, gpu)
+        self.write()
+
     def skipped(self, step: str) -> None:
-        self.rows.append((self.current_stage, step, time.perf_counter() - self.t0, 0.0, "skipped"))
+        self.rows.append((self.current_stage, step, time.perf_counter() - self.t0, 0.0, "skipped", None, None))
         self.write()
 
     def stage_totals(self) -> list[tuple[str, float]]:
         totals: dict[str, float] = {}
-        for stage, _, _, duration, _ in self.rows:
+        for stage, _, _, duration, *_ in self.rows:
             totals[stage] = totals.get(stage, 0.0) + duration
         return list(totals.items())
+
+    def stage_peaks(self) -> dict[str, tuple[float | None, float | None]]:
+        """stage -> (peak RAM GB, peak GPU GB) over the stage's commands (None if nothing was measured)."""
+        peaks: dict[str, tuple[float | None, float | None]] = {}
+        for stage, _, _, _, _, ram, gpu in self.rows:
+            old_ram, old_gpu = peaks.get(stage, (None, None))
+            peaks[stage] = (_max_or_none(old_ram, ram), _max_or_none(old_gpu, gpu))
+        return peaks
 
     def write(self) -> None:
         if self.path is None:
@@ -88,8 +106,8 @@ class Profiler:
         with open(self.path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(self.COLUMNS)
-            for stage, step, start, duration, status in self.rows:
-                writer.writerow([stage, step, f"{start:.3f}", f"{duration:.3f}", status])
+            for stage, step, start, duration, status, ram, gpu in self.rows:
+                writer.writerow([stage, step, f"{start:.3f}", f"{duration:.3f}", status, _fmt_gb(ram), _fmt_gb(gpu)])
             for stage, duration in totals:
                 writer.writerow([stage, "total", "", f"{duration:.3f}", ""])
             writer.writerow(["all", "total", "", f"{sum(d for s, d in totals if s != 'gui'):.3f}", ""])
@@ -110,25 +128,104 @@ class Profiler:
 PROFILER = Profiler()
 
 
-def run(cmd: list[str], capture: bool = False, exit_on_error: bool = True) -> str:
+def _max_or_none(a: float | None, b: float | None) -> float | None:
+    return b if a is None else a if b is None else max(a, b)
+
+
+def _fmt_gb(value: float | None) -> str:
+    return "" if value is None else f"{value:.3f}"
+
+
+class MemorySampler:
+    """Peak memory of one command's process tree (the command and every process it starts, e.g. pixi -> python),
+    sampled every `interval` s while it runs:
+      RAM: sum of VmRSS over the tree (/proc, Linux only);
+      GPU: sum of the tree's entries in `nvidia-smi --query-compute-apps` (per process, so other users' jobs on a
+           shared HPC node are not counted). Stays None when nvidia-smi lists none of the tree's processes.
+    run() also takes the kernel's ru_maxrss of the tree, which catches RAM peaks shorter than the interval."""
+
+    def __init__(self, pid: int, interval: float = 1.0) -> None:
+        self.pid, self.interval = pid, interval
+        self.peak_ram_gb: float | None = None
+        self.peak_gpu_gb: float | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def _tree(self) -> list[int]:
+        pids, stack = [], [self.pid]
+        while stack:
+            pid = stack.pop()
+            pids.append(pid)
+            try:
+                for task in os.listdir(f"/proc/{pid}/task"):
+                    with open(f"/proc/{pid}/task/{task}/children") as f:
+                        stack.extend(int(c) for c in f.read().split())
+            except OSError:
+                pass
+        return pids
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            pids = self._tree()
+            ram_kb = 0
+            for pid in pids:
+                try:
+                    with open(f"/proc/{pid}/status") as f:
+                        ram_kb += next((int(line.split()[1]) for line in f if line.startswith("VmRSS:")), 0)
+                except OSError:
+                    pass
+            if ram_kb:
+                self.peak_ram_gb = _max_or_none(self.peak_ram_gb, ram_kb / 1024**2)
+            out = shell_output(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"])
+            gpu_mb = [int(m) for p, m in re.findall(r"^\s*(\d+),\s*(\d+)", out, re.MULTILINE) if int(p) in pids]
+            if gpu_mb:
+                self.peak_gpu_gb = _max_or_none(self.peak_gpu_gb, sum(gpu_mb) / 1024)
+
+
+def run(cmd: list[str], capture: bool = False, exit_on_error: bool = True, step: str | None = None,
+        profile: bool = True) -> str:
     """Run a command; on failure exit with its return code (default) or raise CalledProcessError
     (exit_on_error=False, for optional stages). Returns the merged output when capture=True.
-    Each call is one row of the profile (step = the colmap sub-command)."""
+    Each call is one row of the profile (step = the colmap sub-command, or `step` when given), with the peak RAM /
+    GPU memory of the command's process tree (MemorySampler). The duration ends when the command exits, before the
+    sampler is stopped. profile=False runs it without a row (setup commands that are not part of the processing)."""
     start = time.perf_counter()
-    if capture:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE if capture else None,
+                               stderr=subprocess.STDOUT if capture else None, text=True)
+    sampler = MemorySampler(process.pid)
+    sampler.start()
+    output = process.stdout.read() if capture else ""
+    if hasattr(os, "wait4"):  # wait4 also returns the tree's resource usage (ru_maxrss: KB on Linux, bytes on macOS)
+        _, wait_status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(wait_status)
+        sampler.peak_ram_gb = _max_or_none(sampler.peak_ram_gb,
+                                           usage.ru_maxrss / (1024**3 if sys.platform == "darwin" else 1024**2))
     else:
-        result = subprocess.run(cmd)
-    step = cmd[1] if len(cmd) > 1 and cmd[0] == "colmap" else os.path.basename(cmd[0])
-    PROFILER.record(step, start, "ok" if result.returncode == 0 else "failed")
-    if result.returncode != 0:
-        print(f"    ERROR: '{' '.join(cmd[:2])}' failed with return code {result.returncode}")
+        process.wait()
+    end = time.perf_counter()
+    sampler.stop()
+    if capture:
+        process.stdout.close()
+    if step is None:
+        step = cmd[1] if len(cmd) > 1 and cmd[0] == "colmap" else os.path.basename(cmd[0])
+    if profile:
+        PROFILER.record(step, start, "ok" if process.returncode == 0 else "failed", sampler.peak_ram_gb,
+                        sampler.peak_gpu_gb, end=end)
+    if process.returncode != 0:
+        print(f"    ERROR: '{' '.join(cmd[:2])}' failed with return code {process.returncode}")
         if capture:
-            print(result.stdout)
+            print(output)
         if not exit_on_error:
-            raise subprocess.CalledProcessError(result.returncode, cmd)
-        sys.exit(result.returncode)
-    return result.stdout if capture else ""
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+        sys.exit(process.returncode)
+    return output
 
 
 def colmap_has_cuda() -> bool:
