@@ -42,17 +42,43 @@ MATCHING_TYPES: dict[str, tuple[str, str]] = {
     'loma_b128_loma': ('LOMA_B128', 'LOMA_B128'),
 }
 
+def per_session_extractions(rgb_path: Path, colmap_image_list: Path, camera_name: str) -> list[tuple[Path, str, str, str]]:
+    """(image list, COLMAP camera model, params, session name) per session of a combined multi-session sequence, for
+    one feature_extractor run each: COLMAP creates one camera per run, so every session gets its own camera with the
+    intrinsics of its own session sequence. A combined sequence links its frames from the session sequences
+    (<session>/<rgb folder>/<frame>), so resolving a frame's symlink gives its session and that session's
+    calibration.yaml. COLMAP itself groups cameras by the folder in the image name and does not follow symlinks."""
+    sessions: dict[Path, list[str]] = {}
+    for name in colmap_image_list.read_text().split():
+        sessions.setdefault((rgb_path / name).resolve().parent.parent, []).append(name)
+
+    extractions = []
+    for session, names in sessions.items():
+        calibration_yaml = session / "calibration.yaml"
+        if not calibration_yaml.exists():
+            raise SystemExit(f"per_session_calibration: no calibration.yaml in session {session}")
+        calibration_model, colmap_model, params = colmap_camera(calibration_yaml, camera_name)
+        if calibration_model == "unknown":
+            raise SystemExit(f"per_session_calibration: {calibration_yaml} is 'unknown'; every session needs known intrinsics")
+        session_list = colmap_image_list.with_name(f"colmap_image_list_{session.name}.txt")
+        session_list.write_text("\n".join(names) + "\n")
+        extractions.append((session_list, colmap_model, params, session.name))
+    return extractions
+
 
 def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rgb_csv: Path, calibration_yaml: Path,
                 camera_name: str, matcher_type: str, matching_type: str, use_gpu: int, use_mask: int,
                 settings: Settings | None = None, single_camera_per_folder: int = 1,
-                hybrid: dict | None = None, camera_model: str = "") -> Path:
+                hybrid: dict | None = None, camera_model: str = "", per_session_calibration: int = 0) -> Path:
     """Build <exp_folder_colmap>/colmap_database.db with features and matches; returns its path.
     settings: the [feature_extractor] / [matcher] sections of the settings yaml (colmap_utilities.load_settings).
-    single_camera_per_folder: 1 -> one camera per image folder (COLMAP resolves symlinks, so combined multi-session
-    sequences get one camera per session); 0 -> one camera for every image (the original hybrid pipeline's setting).
+    single_camera_per_folder: 1 -> one camera per image folder as named in the image list (COLMAP does not follow
+    symlinks, so a combined multi-session sequence's single rgb folder still gets one camera); 0 -> one camera for
+    every image (the original hybrid pipeline's setting).
     hybrid: options of matcher_type 'hybrid' (see run_hybrid).
-    camera_model: COLMAP camera model for an 'unknown' calibration ('' -> OPENCV); a known calibration sets its own."""
+    camera_model: COLMAP camera model for an 'unknown' calibration ('' -> OPENCV); a known calibration sets its own.
+    per_session_calibration: 1 -> one camera per session of a combined sequence, each with the intrinsics of its own
+    session sequence's calibration.yaml (per_session_extractions); 0 -> the combined sequence's calibration.yaml."""
     settings = settings or {}
     print("\nExecuting colmap_matcher ...")
     PROFILER.set_stage("extraction")
@@ -68,6 +94,9 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
         if calibration_model != "unknown":
             raise SystemExit(f"camera_model {camera_model} needs an 'unknown' calibration; {calibration_yaml} has {calibration_model}")
         colmap_camera_model = camera_model
+    if per_session_calibration and calibration_model == "unknown":
+        # the mapper refines 'unknown' cameras regardless of optimize_intrinsics (colmap_mapper.run_mapper)
+        raise SystemExit(f"per_session_calibration needs known intrinsics in {calibration_yaml}, not 'unknown'")
 
     colmap_image_list = exp_folder_colmap / "colmap_image_list.txt"
     create_colmap_image_list(str(rgb_csv), str(colmap_image_list), camera_name)
@@ -79,10 +108,11 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
     print(f"    colmap feature_extractor ({feature_extraction_type}) ...")
     print(f"        gpu_index: {gpu_index_list}")
     print(f"        camera model : {calibration_model} (colmap: {colmap_camera_model})")
-    camera_params_args: list[str] = []
-    if camera_params:
+    extractions = [(colmap_image_list, colmap_camera_model, camera_params, "")]
+    if per_session_calibration:
+        extractions = per_session_extractions(rgb_path, colmap_image_list, camera_name)
+    elif camera_params:
         print(f"        camera params: {camera_params}")
-        camera_params_args = ["--ImageReader.camera_params", camera_params]
 
     # Masks (use_mask=1): the rgb csv's path_mask_<i> column (1 = usable pixel, 0 = masked out - no
     # features are extracted where the mask is 0). One shared mask (refrax) goes through
@@ -106,19 +136,22 @@ def run_matcher(sequence_path: Path, exp_folder_colmap: Path, rgb_path: Path, rg
                           "ImageReader.camera_params", "ImageReader.camera_mask_path", "ImageReader.mask_path",
                           "FeatureExtraction.type", "FeatureExtraction.use_gpu", "FeatureExtraction.gpu_index",
                           "FeatureExtraction.num_threads"]
-    run(["colmap", "feature_extractor",
-         "--database_path", str(database),
-         "--image_path", str(rgb_path),
-         "--image_list_path", str(colmap_image_list),
-         "--ImageReader.camera_model", colmap_camera_model,
-         "--ImageReader.single_camera", "1",
-         "--ImageReader.single_camera_per_folder", str(single_camera_per_folder),
-         "--FeatureExtraction.type", feature_extraction_type,
-         "--FeatureExtraction.use_gpu", str(use_gpu),
-         "--FeatureExtraction.gpu_index", gpu_index_list,
-         "--FeatureExtraction.num_threads", str(num_threads),
-         *camera_params_args, *mask_args,
-         *settings_args(settings, "feature_extractor", "feature_extractor", extractor_explicit)])
+    for image_list, model, params, session in extractions:
+        if session:
+            print(f"        session {session}: {model} {params} ({image_list.name})")
+        run(["colmap", "feature_extractor",
+             "--database_path", str(database),
+             "--image_path", str(rgb_path),
+             "--image_list_path", str(image_list),
+             "--ImageReader.camera_model", model,
+             "--ImageReader.single_camera", "1",
+             "--ImageReader.single_camera_per_folder", str(single_camera_per_folder),
+             "--FeatureExtraction.type", feature_extraction_type,
+             "--FeatureExtraction.use_gpu", str(use_gpu),
+             "--FeatureExtraction.gpu_index", gpu_index_list,
+             "--FeatureExtraction.num_threads", str(num_threads),
+             *(["--ImageReader.camera_params", params] if params else []), *mask_args,
+             *settings_args(settings, "feature_extractor", "feature_extractor", extractor_explicit)])
 
     matching_args = ["--database_path", str(database),
                      "--FeatureMatching.type", feature_matching_type,

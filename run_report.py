@@ -134,7 +134,10 @@ def configuration_section(args, exp_folder_colmap: Path, settings: Settings) -> 
     config["mapper"] = {
         "type": "COLMAP incremental mapper" if args.mapper_type == "colmap" else "COLMAP global mapper (GLOMAP)",
         "optimize_intrinsics": bool(args.optimize_intrinsics),
-        "cameras": "one shared camera" if args.single_camera_per_folder == 0 else "one camera per session folder",
+        # COLMAP groups cameras by the folder in the image name: a combined sequence's single rgb folder means one
+        # shared camera unless per_session_calibration extracts each session with its own camera
+        "cameras": ("one camera per session, intrinsics from each session's calibration.yaml" if args.per_session_calibration
+                    else "one shared camera" if args.single_camera_per_folder == 0 else "one camera per image folder"),
         "random_seed": args.random_seed,
     }
     return config

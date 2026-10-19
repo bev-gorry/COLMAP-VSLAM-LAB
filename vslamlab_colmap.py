@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesher", type=str, default="none", choices=list(MESHERS))
     # Camera grouping, repeatability, and matcher_type 'hybrid' (colmap_matcher.run_hybrid)
     parser.add_argument("--single_camera_per_folder", type=int, default=1)
+    parser.add_argument("--per_session_calibration", type=int, default=0)
     parser.add_argument("--random_seed", type=int, default=-1)
     parser.add_argument("--hybrid_features", type=str, default="superpoint", choices=["superpoint", "aliked", "sift"])
     parser.add_argument("--hybrid_matching", type=str, default="lightglue", choices=["lightglue", "bruteforce"])
@@ -97,6 +98,7 @@ def main() -> None:
     print(f"  Dense Max Img Size: {args.dense_max_image_size}")
     print(f"  Mesher            : {args.mesher}")
     print(f"  Camera per folder : {args.single_camera_per_folder}")
+    print(f"  Per-session calib.: {args.per_session_calibration}")
     print(f"  Random seed       : {args.random_seed}")
     if args.matcher_type == "hybrid":
         print(f"  Hybrid features   : {args.hybrid_features} + {args.hybrid_matching}")
@@ -147,7 +149,7 @@ def run_pipeline(args: argparse.Namespace, exp_id: str, exp_folder_colmap: Path)
     database = run_matcher(args.sequence_path, exp_folder_colmap, rgb_path, args.rgb_csv, args.calibration_yaml, args.camera_name,
                            args.matcher_type, args.matching_type, args.use_gpu, args.use_mask, settings,
                            single_camera_per_folder=args.single_camera_per_folder, hybrid=hybrid,
-                           camera_model=args.camera_model)
+                           camera_model=args.camera_model, per_session_calibration=args.per_session_calibration)
     best_model = run_mapper(exp_folder_colmap, rgb_path, args.calibration_yaml, args.camera_name, args.mapper_type,
                             args.optimize_intrinsics, settings, random_seed=args.random_seed)
 
