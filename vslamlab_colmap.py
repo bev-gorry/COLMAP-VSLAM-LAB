@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single_camera_per_folder", type=int, default=1)
     parser.add_argument("--per_session_calibration", type=int, default=0)
     parser.add_argument("--random_seed", type=int, default=-1)
+    parser.add_argument("--init_pair", type=str, default="colmap", choices=["colmap", "cross_session"])
     parser.add_argument("--hybrid_features", type=str, default="superpoint", choices=["superpoint", "aliked", "sift"])
     parser.add_argument("--hybrid_matching", type=str, default="lightglue", choices=["lightglue", "bruteforce"])
     parser.add_argument("--pair_selection", type=str, default="vpr", choices=["vpr", "cross_session", "all"])
@@ -100,6 +101,7 @@ def main() -> None:
     print(f"  Camera per folder : {args.single_camera_per_folder}")
     print(f"  Per-session calib.: {args.per_session_calibration}")
     print(f"  Random seed       : {args.random_seed}")
+    print(f"  Initial pair      : {args.init_pair}")
     if args.matcher_type == "hybrid":
         print(f"  Hybrid features   : {args.hybrid_features} + {args.hybrid_matching}")
         print(f"  Pair selection    : {args.pair_selection} (vpr_threshold {args.vpr_threshold})")
@@ -151,7 +153,8 @@ def run_pipeline(args: argparse.Namespace, exp_id: str, exp_folder_colmap: Path)
                            single_camera_per_folder=args.single_camera_per_folder, hybrid=hybrid,
                            camera_model=args.camera_model, per_session_calibration=args.per_session_calibration)
     best_model = run_mapper(exp_folder_colmap, rgb_path, args.calibration_yaml, args.camera_name, args.mapper_type,
-                            args.optimize_intrinsics, settings, random_seed=args.random_seed)
+                            args.optimize_intrinsics, settings, random_seed=args.random_seed,
+                            init_pair=args.init_pair, rgb_csv=args.rgb_csv)
 
     # Convert COLMAP outputs to a format suitable for VSLAM-LAB
     PROFILER.set_stage("trajectory")

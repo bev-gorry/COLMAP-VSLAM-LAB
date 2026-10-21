@@ -10,12 +10,20 @@ Module: VSLAM-LAB - Baselines - colmap - colmap_mapper.py
 Mapping stage of the colmap pipeline (Python port of colmap_mapper.sh): runs COLMAP's incremental
 mapper or GLOMAP's global mapper on the database, picks the sub-model with the most registered
 images and exports it as TXT into the colmap folder. Called by vslamlab_colmap.py.
+init_pair 'cross_session' starts the incremental mapper from the cross-session image pair with the most verified
+matches (cross_session_init_pair).
 """
 
+import os
 import re
+import sqlite3
 from pathlib import Path
 
+import pandas as pd
+
 from colmap_utilities import PROFILER, Settings, colmap_camera, run, settings_args
+
+MAX_NUM_IMAGES = 2147483647  # COLMAP's pair_id = image_id1 * MAX_NUM_IMAGES + image_id2
 
 
 def registered_images(model_dir: Path) -> int:
@@ -42,11 +50,35 @@ def select_best_model(exp_folder_colmap: Path) -> tuple[Path, int]:
     return best_model, best_num_images
 
 
+def cross_session_init_pair(database: Path, rgb_csv: Path, camera_name: str) -> tuple[int, int, int]:
+    """(image_id1, image_id2, inliers) of the verified image pair from two different sessions (rgb csv's sequence_name)
+    with the most inlier matches. Why: in a hybrid run the learned keypoints are matched only across sessions, so they
+    are triangulated only once a model holds two sessions; a model started inside one session cannot register the
+    other sessions through them and the reconstruction fragments."""
+    df = pd.read_csv(rgb_csv)
+    if "sequence_name" not in df.columns:
+        raise SystemExit(f"    init_pair cross_session: {rgb_csv} has no sequence_name column")
+    session = dict(zip((os.path.basename(str(p)) for p in df[f"path_{camera_name}"]), df["sequence_name"].astype(str)))
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
+        names = {i: os.path.basename(n) for i, n in conn.execute("SELECT image_id, name FROM images")}
+        best = (0, 0, 0)
+        for pair_id, rows in conn.execute("SELECT pair_id, rows FROM two_view_geometries WHERE rows > 0"):
+            id2 = pair_id % MAX_NUM_IMAGES
+            id1 = (pair_id - id2) // MAX_NUM_IMAGES
+            if session[names[id1]] != session[names[id2]] and rows > best[2]:
+                best = (id1, id2, rows)
+    if best[2] == 0:
+        raise SystemExit("    init_pair cross_session: no verified cross-session image pair in the database")
+    return best
+
+
 def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, camera_name: str,
                mapper_type: str, optimize_intrinsics: int, settings: Settings | None = None,
-               random_seed: int = -1) -> Path:
+               random_seed: int = -1, init_pair: str = "colmap", rgb_csv: Path | None = None) -> Path:
     """Reconstruct from <exp_folder_colmap>/colmap_database.db; returns the best sub-model folder.
-    settings: the [mapper] section of the settings yaml (Mapper_* keys reach mapper, GlobalMapper_* keys glomap)."""
+    settings: the [mapper] section of the settings yaml (Mapper_* keys reach mapper, GlobalMapper_* keys glomap).
+    init_pair: 'colmap' (COLMAP chooses the initial pair) or 'cross_session' (incremental mapper only: the
+    cross-session pair with the most verified matches, see cross_session_init_pair; needs rgb_csv)."""
     print("Executing colmap_mapper ...")
     settings = settings or {}
     PROFILER.set_stage("reconstruction")
@@ -77,6 +109,12 @@ def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, 
     # random_seed: -1 keeps COLMAP's default (non-deterministic); >= 0 makes reruns repeatable
     explicit = [f"{prefix}.ba_refine_focal_length", f"{prefix}.ba_refine_principal_point", f"{prefix}.ba_refine_extra_params",
                 f"{prefix}.random_seed"]
+    init_args: list[str] = []
+    if init_pair == "cross_session" and mapper_type != "glomap":
+        id1, id2, inliers = cross_session_init_pair(database, rgb_csv, camera_name)
+        print(f"        initial pair: images {id1} and {id2} (cross-session, {inliers} verified matches)")
+        init_args = [f"--{prefix}.init_image_id1", str(id1), f"--{prefix}.init_image_id2", str(id2)]
+        explicit += [f"{prefix}.init_image_id1", f"{prefix}.init_image_id2"]
     run(["colmap", command,
          "--database_path", str(database),
          "--image_path", str(rgb_path),
@@ -85,6 +123,7 @@ def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, 
          f"--{prefix}.ba_refine_principal_point", ba_refine_principal_point,
          f"--{prefix}.ba_refine_extra_params", ba_refine_extra_params,
          f"--{prefix}.random_seed", str(random_seed),
+         *init_args,
          *settings_args(settings, "mapper", command, explicit)])
 
     best_model, best_num_images = select_best_model(exp_folder_colmap)

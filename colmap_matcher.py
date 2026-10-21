@@ -47,14 +47,19 @@ def per_session_extractions(rgb_path: Path, colmap_image_list: Path, camera_name
     one feature_extractor run each: COLMAP creates one camera per run, so every session gets its own camera with the
     intrinsics of its own session sequence. A combined sequence links its frames from the session sequences
     (<session>/<rgb folder>/<frame>), so resolving a frame's symlink gives its session and that session's
-    calibration.yaml. COLMAP itself groups cameras by the folder in the image name and does not follow symlinks."""
+    calibration.yaml. COLMAP itself groups cameras by the folder in the image name and does not follow symlinks.
+    A calibration.yaml in the frame's own folder takes precedence: a refrax_0/ artifact holds the session's corrected
+    camera there (<session>/refrax_0/calibration.yaml), each session corrected with its own z0."""
     sessions: dict[Path, list[str]] = {}
     for name in colmap_image_list.read_text().split():
-        sessions.setdefault((rgb_path / name).resolve().parent.parent, []).append(name)
+        sessions.setdefault((rgb_path / name).resolve().parent, []).append(name)
 
     extractions = []
-    for session, names in sessions.items():
-        calibration_yaml = session / "calibration.yaml"
+    for folder, names in sessions.items():
+        session = folder.parent
+        calibration_yaml = folder / "calibration.yaml"
+        if not calibration_yaml.exists():
+            calibration_yaml = session / "calibration.yaml"
         if not calibration_yaml.exists():
             raise SystemExit(f"per_session_calibration: no calibration.yaml in session {session}")
         calibration_model, colmap_model, params = colmap_camera(calibration_yaml, camera_name)

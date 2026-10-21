@@ -142,12 +142,13 @@ def vpr_pair_matrix(distance_matrix: np.ndarray, session_names: np.ndarray, thre
 
 
 def image_rows_by_name(csv_path: Path, camera_name: str, need_sessions: bool) -> tuple[dict[str, int], np.ndarray | None]:
-    """Row index of every frame in a VSLAM-LAB rgb csv, keyed by file name, plus the session of each row
-    (the csv's sequence_name column; required when need_sessions)."""
+    """Row index of every frame in a VSLAM-LAB rgb csv, keyed by file stem, plus the session of each row
+    (the csv's sequence_name column; required when need_sessions). Stems, so that the database's refraction-corrected
+    frames (refrax_0/<stem>.png) find their rows in an rgb.csv of the original frames (rgb_0/<stem>.JPG)."""
     df = pd.read_csv(csv_path)
-    names = [os.path.basename(str(p)) for p in df[f"path_{camera_name}"]]
+    names = [os.path.splitext(os.path.basename(str(p)))[0] for p in df[f"path_{camera_name}"]]
     if len(set(names)) != len(names):
-        raise SystemExit(f"{SCRIPT_LABEL}image file names are not unique in {csv_path}; cannot index images by name")
+        raise SystemExit(f"{SCRIPT_LABEL}image file stems are not unique in {csv_path}; cannot index images by name")
     if "sequence_name" not in df.columns:
         if need_sessions:
             raise SystemExit(f"{SCRIPT_LABEL}{csv_path} has no sequence_name column; same-session pairs cannot be identified")
@@ -230,8 +231,9 @@ def main() -> None:
     images = read_images(cursor)
     image_ids = sorted(images.keys())
     image_names = {image_id: os.path.basename(images[image_id]) for image_id in image_ids}
-    if len(set(image_names.values())) != len(image_ids):
-        raise SystemExit(f"{SCRIPT_LABEL}image file names in the database are not unique")
+    image_stems = {image_id: os.path.splitext(name)[0] for image_id, name in image_names.items()}
+    if len(set(image_stems.values())) != len(image_ids):
+        raise SystemExit(f"{SCRIPT_LABEL}image file stems in the database are not unique")
 
     # 1. SIFT keypoints and raw SIFT matches written by colmap exhaustive_matcher
     sift_keypoints = read_keypoints(cursor)
@@ -252,11 +254,11 @@ def main() -> None:
         D = np.load(args.vpr_matrix)
         if D.shape != (len(vpr_rows), len(vpr_rows)):
             raise SystemExit(f"{SCRIPT_LABEL}VPR matrix {D.shape} does not match {len(vpr_rows)} rows of {vpr_rgb_csv}")
-        missing = [n for n in image_names.values() if n not in vpr_rows]
+        missing = [n for n in image_stems.values() if n not in vpr_rows]
         if missing:
             raise SystemExit(f"{SCRIPT_LABEL}{len(missing)} database images are not rows of {vpr_rgb_csv} (e.g. {missing[:3]})")
         selected_full = vpr_pair_matrix(D, vpr_sessions, args.vpr_threshold)
-        rows = np.array([vpr_rows[image_names[image_id]] for image_id in image_ids])
+        rows = np.array([vpr_rows[image_stems[image_id]] for image_id in image_ids])
         # The original pipeline used D[i, j] with i < j in database order (upper triangle); keep that orientation.
         selected = selected_full[np.ix_(rows, rows)]
         stats["vpr"] = {"matrix": str(args.vpr_matrix), "rgb_csv": str(vpr_rgb_csv), "matrix_shape": list(D.shape),
@@ -264,7 +266,7 @@ def main() -> None:
                         "database_order_equals_matrix_order": bool(np.array_equal(rows, np.arange(num_images)))}
     elif args.pair_selection == "cross_session":
         exp_rows, exp_sessions = image_rows_by_name(args.rgb_csv, args.camera_name, need_sessions=True)
-        sessions = np.array([exp_sessions[exp_rows[image_names[image_id]]] for image_id in image_ids])
+        sessions = np.array([exp_sessions[exp_rows[image_stems[image_id]]] for image_id in image_ids])
         selected = sessions[:, None] != sessions[None, :]
     else:
         selected = ~np.eye(num_images, dtype=bool)
