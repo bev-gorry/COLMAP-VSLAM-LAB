@@ -1,6 +1,7 @@
 """
 Re-run only the mapping stage of finished colmap runs, starting the incremental mapper from the cross-session image
-pair with the most verified matches (init_pair cross_session, see colmap_mapper.cross_session_init_pair). Feature
+pair with the most verified matches that has enough parallax for COLMAP (init_pair cross_session, see
+colmap_mapper.cross_session_init_pair). Feature
 extraction, matching and verification are deterministic, so the run's own database is reused as it is.
 
   check   (default) per run: the sessions of the initial pair COLMAP chose (from the system output), sub-models and

@@ -139,7 +139,7 @@ def configuration_section(args, exp_folder_colmap: Path, settings: Settings) -> 
         "cameras": ("one camera per session, intrinsics from each session's calibration.yaml" if args.per_session_calibration
                     else "one shared camera" if args.single_camera_per_folder == 0 else "one camera per image folder"),
         "random_seed": args.random_seed,
-        "initial_pair": ("cross-session pair with the most verified matches" if getattr(args, "init_pair", "colmap") == "cross_session"
+        "initial_pair": ("cross-session pair with the most verified matches and >= 1.25 x init_min_tri_angle parallax" if getattr(args, "init_pair", "colmap") == "cross_session"
                          else "chosen by COLMAP"),
     }
     return config

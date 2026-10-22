@@ -16,9 +16,12 @@ matches (cross_session_init_pair).
 
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from colmap_utilities import PROFILER, Settings, colmap_camera, run, settings_args
@@ -50,26 +53,95 @@ def select_best_model(exp_folder_colmap: Path) -> tuple[Path, int]:
     return best_model, best_num_images
 
 
-def cross_session_init_pair(database: Path, rgb_csv: Path, camera_name: str) -> tuple[int, int, int]:
-    """(image_id1, image_id2, inliers) of the verified image pair from two different sessions (rgb csv's sequence_name)
-    with the most inlier matches. Why: in a hybrid run the learned keypoints are matched only across sessions, so they
-    are triangulated only once a model holds two sessions; a model started inside one session cannot register the
-    other sessions through them and the reconstruction fragments."""
+TWO_VIEW_CALIBRATED = 2  # COLMAP TwoViewGeometry config with an essential matrix (known intrinsics)
+INIT_ANGLE_MARGIN = 1.25  # initial pair: median triangulation angle >= 1.25 x Mapper.init_min_tri_angle
+
+
+def undistorted_rays(uv: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """Unit viewing rays of COLMAP keypoints (pixel-centre convention, +0.5) for an OPENCV/PINHOLE camera
+    (f, fy, cx, cy[, k1, k2, p1, p2]); the radial-tangential distortion is inverted by fixed-point iteration."""
+    f, fy, cx, cy = params[:4]
+    k1, k2, p1, p2 = (list(params[4:8]) + [0.0] * 4)[:4]
+    xd, yd = (uv[:, 0] - 0.5 - cx) / f, (uv[:, 1] - 0.5 - cy) / fy
+    x, y = xd.copy(), yd.copy()
+    for _ in range(20):
+        r2 = x * x + y * y
+        radial = 1 + k1 * r2 + k2 * r2 * r2
+        x = (xd - (2 * p1 * x * y + p2 * (r2 + 2 * x * x))) / radial
+        y = (yd - (p1 * (r2 + 2 * y * y) + 2 * p2 * x * y)) / radial
+    rays = np.c_[x, y, np.ones_like(x)]
+    return rays / np.linalg.norm(rays, axis=1, keepdims=True)
+
+
+def median_triangulation_angle(E: np.ndarray, rays1: np.ndarray, rays2: np.ndarray) -> float:
+    """Median angle (deg) between the two viewing rays of each match, with the relative pose decomposed from the
+    pair's essential matrix (the decomposition with most points in front of both cameras). This is the parallax
+    COLMAP's initialisation requires to be at least Mapper.init_min_tri_angle."""
+    U, _, Vt = np.linalg.svd(E)
+    U, Vt = U * np.sign(np.linalg.det(U)), Vt * np.sign(np.linalg.det(Vt))
+    W = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+    best = (-1, 0.0)
+    for R in (U @ W @ Vt, U @ W.T @ Vt):
+        for t in (U[:, 2], -U[:, 2]):
+            # camera 2 = R X + t; camera 2's centre and rays in camera 1's frame
+            c2, d2 = -R.T @ t, rays2 @ R
+            # depths s1, s2 of the closest points along both rays (midpoint triangulation)
+            a12 = (rays1 * d2).sum(1)
+            denom = 1 - a12 ** 2
+            ok = denom > 1e-12
+            s1 = np.where(ok, (rays1 @ c2 - a12 * (d2 @ c2)) / np.where(ok, denom, 1), 0)
+            s2 = np.where(ok, (a12 * (rays1 @ c2) - d2 @ c2) / np.where(ok, denom, 1), 0)
+            front = (s1 > 0) & (s2 > 0)
+            if front.sum() > best[0]:
+                X = s1[:, None] * rays1
+                v2 = X - c2
+                cos = (rays1 * v2).sum(1) / np.maximum(np.linalg.norm(v2, axis=1), 1e-12)
+                angles = np.degrees(np.arccos(np.clip(cos, -1, 1)))[front]
+                best = (int(front.sum()), float(np.median(angles)) if angles.size else 0.0)
+    return best[1]
+
+
+def cross_session_init_pair(database: Path, rgb_csv: Path, camera_name: str, min_tri_angle: float = 16.0,
+                            min_num_inliers: int = 100) -> tuple[int, int, int, float] | None:
+    """(image_id1, image_id2, inliers, median triangulation angle) of the initial pair: of the verified pairs from two
+    different sessions (rgb csv's sequence_name) with an essential matrix, at least min_num_inliers inliers and a
+    median triangulation angle of at least min_tri_angle (COLMAP's own initialisation thresholds), the one with the most
+    inliers. Why cross-session: in a hybrid run the learned keypoints are matched only across sessions, so they are
+    triangulated only once a model holds two sessions; a model started inside one session cannot register the other
+    sessions through them and the reconstruction fragments. Why the angle: the pairs with the most matches are often
+    near-identical viewpoints, which COLMAP rejects (or accepts only after relaxing its thresholds).
+    None if no pair qualifies."""
     df = pd.read_csv(rgb_csv)
     if "sequence_name" not in df.columns:
         raise SystemExit(f"    init_pair cross_session: {rgb_csv} has no sequence_name column")
     session = dict(zip((os.path.basename(str(p)) for p in df[f"path_{camera_name}"]), df["sequence_name"].astype(str)))
     with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as conn:
         names = {i: os.path.basename(n) for i, n in conn.execute("SELECT image_id, name FROM images")}
-        best = (0, 0, 0)
-        for pair_id, rows in conn.execute("SELECT pair_id, rows FROM two_view_geometries WHERE rows > 0"):
+        camera_of = dict(conn.execute("SELECT image_id, camera_id FROM images"))
+        params = {c: np.frombuffer(p, np.float64) for c, p in conn.execute("SELECT camera_id, params FROM cameras")}
+        candidates = []
+        for pair_id, rows, config in conn.execute("SELECT pair_id, rows, config FROM two_view_geometries WHERE rows > 0"):
             id2 = pair_id % MAX_NUM_IMAGES
             id1 = (pair_id - id2) // MAX_NUM_IMAGES
-            if session[names[id1]] != session[names[id2]] and rows > best[2]:
-                best = (id1, id2, rows)
-    if best[2] == 0:
-        raise SystemExit("    init_pair cross_session: no verified cross-session image pair in the database")
-    return best
+            if session[names[id1]] != session[names[id2]] and config == TWO_VIEW_CALIBRATED and rows >= min_num_inliers:
+                candidates.append((rows, pair_id, id1, id2))
+        keypoints: dict[int, np.ndarray] = {}
+
+        def keypoints_of(image_id):
+            if image_id not in keypoints:
+                r, c, d = conn.execute("SELECT rows, cols, data FROM keypoints WHERE image_id = ?", (image_id,)).fetchone()
+                keypoints[image_id] = np.frombuffer(d, np.float32).reshape(r, c)[:, :2].astype(np.float64)
+            return keypoints[image_id]
+
+        for rows, pair_id, id1, id2 in sorted(candidates, reverse=True):
+            data, E = conn.execute("SELECT data, E FROM two_view_geometries WHERE pair_id = ?", (pair_id,)).fetchone()
+            matches = np.frombuffer(data, np.uint32).reshape(rows, 2)
+            rays1 = undistorted_rays(keypoints_of(id1)[matches[:, 0]], params[camera_of[id1]])
+            rays2 = undistorted_rays(keypoints_of(id2)[matches[:, 1]], params[camera_of[id2]])
+            angle = median_triangulation_angle(np.frombuffer(E, np.float64).reshape(3, 3), rays1, rays2)
+            if angle >= min_tri_angle:
+                return id1, id2, rows, angle
+    return None
 
 
 def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, camera_name: str,
@@ -111,20 +183,37 @@ def run_mapper(exp_folder_colmap: Path, rgb_path: Path, calibration_yaml: Path, 
                 f"{prefix}.random_seed"]
     init_args: list[str] = []
     if init_pair == "cross_session" and mapper_type != "glomap":
-        id1, id2, inliers = cross_session_init_pair(database, rgb_csv, camera_name)
-        print(f"        initial pair: images {id1} and {id2} (cross-session, {inliers} verified matches)")
-        init_args = [f"--{prefix}.init_image_id1", str(id1), f"--{prefix}.init_image_id2", str(id2)]
-        explicit += [f"{prefix}.init_image_id1", f"{prefix}.init_image_id2"]
-    run(["colmap", command,
-         "--database_path", str(database),
-         "--image_path", str(rgb_path),
-         "--output_path", str(exp_folder_colmap),
-         f"--{prefix}.ba_refine_focal_length", ba_refine_focal_length,
-         f"--{prefix}.ba_refine_principal_point", ba_refine_principal_point,
-         f"--{prefix}.ba_refine_extra_params", ba_refine_extra_params,
-         f"--{prefix}.random_seed", str(random_seed),
-         *init_args,
-         *settings_args(settings, "mapper", command, explicit)])
+        mapper_settings = settings.get("mapper", {})
+        # 1.25 x COLMAP's own minimum: the angle here is estimated from the stored essential matrix and differs from
+        # COLMAP's by up to ~3 deg, and a pair COLMAP rejects is retried only after relaxing its thresholds
+        min_tri_angle = INIT_ANGLE_MARGIN * float(mapper_settings.get("Mapper.init_min_tri_angle", 16))
+        pair = cross_session_init_pair(database, rgb_csv, camera_name, min_tri_angle,
+                                       int(mapper_settings.get("Mapper.init_min_num_inliers", 100)))
+        if pair is None:
+            print(f"        WARNING: no cross-session pair with a median triangulation angle >= {min_tri_angle:.0f} deg; "
+                  f"COLMAP chooses the initial pair")
+        else:
+            id1, id2, inliers, angle = pair
+            print(f"        initial pair: images {id1} and {id2} (cross-session, {inliers} verified matches, "
+                  f"median triangulation angle {angle:.1f} deg)")
+            init_args = [f"--{prefix}.init_image_id1", str(id1), f"--{prefix}.init_image_id2", str(id2)]
+            explicit += [f"{prefix}.init_image_id1", f"{prefix}.init_image_id2"]
+    base = ["colmap", command,
+            "--database_path", str(database),
+            "--image_path", str(rgb_path),
+            "--output_path", str(exp_folder_colmap),
+            f"--{prefix}.ba_refine_focal_length", ba_refine_focal_length,
+            f"--{prefix}.ba_refine_principal_point", ba_refine_principal_point,
+            f"--{prefix}.ba_refine_extra_params", ba_refine_extra_params,
+            f"--{prefix}.random_seed", str(random_seed)]
+    try:
+        run([*base, *init_args, *settings_args(settings, "mapper", command, explicit)], exit_on_error=not init_args)
+    except subprocess.CalledProcessError:
+        # Only with a given initial pair: COLMAP could not start from it, so start again from COLMAP's own choice
+        print("        WARNING: the mapper failed from the given initial pair; retrying with COLMAP's own choice")
+        for model_dir in (p for p in exp_folder_colmap.iterdir() if p.is_dir() and p.name.isdigit()):
+            shutil.rmtree(model_dir)
+        run([*base, *settings_args(settings, "mapper", command, explicit[:4])])
 
     best_model, best_num_images = select_best_model(exp_folder_colmap)
 
